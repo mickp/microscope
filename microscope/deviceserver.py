@@ -25,7 +25,6 @@ working directory, or default test objects found in microscope.config.
 """
 
 import imp
-import importlib
 import logging
 import multiprocessing
 import os
@@ -50,7 +49,7 @@ LOG_FORMATTER = logging.Formatter('%(asctime)s %(levelname)s PID %(process)s: %(
 
 
 class DeviceServer(multiprocessing.Process):
-    def __init__(self, device_def, id_to_host, id_to_port, count=0, exit_event=None):
+    def __init__(self, device_def, id_to_host, id_to_port, count=0, exit_event=None, hmac=None):
         """Initialise a device and serve at host/port according to its id.
 
         :param device_def:  definition of the device
@@ -71,6 +70,7 @@ class DeviceServer(multiprocessing.Process):
         self.daemon = True
         # Some SDKs need an index to access more than one device.
         self.count = count
+        self.hmac = hmac
 
     def run(self):
         self._device = self._device_def['cls'](index=self.count, **self._device_def)
@@ -105,9 +105,12 @@ class DeviceServer(multiprocessing.Process):
 
         # Run the Pyro daemon in a separate thread so that we can do
         # clean shutdown under Windows.
-        pyro_thread = Thread(target=Pyro4.Daemon.serveSimple,
-                             args=({self._device: type(self).__name__},),
-                             kwargs={'daemon': pyro_daemon, 'ns': False})
+        # servesimple does not appear to support hmac-protected nameservers.
+        ns = Pyro4.locateNS(hmac_key=self.hmac)
+        uri = pyro_daemon.register(self._device)
+        ns.register(type(self).__name__ + '@' + str(port), uri)
+        pyro_thread = Thread(target=pyro_daemon.requestLoop,
+                             kwargs={'loopCondition': lambda: self.exit_event,})
         pyro_thread.daemon = True
         pyro_thread.start()
         if self.exit_event:
@@ -163,6 +166,10 @@ def __main__():
     for dev in config.DEVICES:
         by_class[dev['cls']] = by_class.get(dev['cls'], []) + [dev]
 
+    _ns_thread = Thread(target=Pyro4.naming.startNSloop,
+                        kwargs={'hmac': config.HMAC})
+    _ns_thread.daemon = True
+    _ns_thread.start()
     servers = []
     for cls, devs in iteritems(by_class):
         # Keep track of how many of these classes we have set up.
@@ -183,11 +190,13 @@ def __main__():
         for dev in devs:
             servers.append(DeviceServer(dev,
                                         uid_to_host, uid_to_port,
-                                        exit_event=exit_event, count=count))
+                                        exit_event=exit_event, count=count,
+                                        hmac=config.HMAC))
             servers[-1].start()
             count += 1
     for s in servers:
         s.join()
+    _ns_thread.join()
 
 
 if __name__ == '__main__':
